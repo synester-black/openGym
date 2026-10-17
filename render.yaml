@@ -73,7 +73,7 @@ services:
       # ride the front site's domain; Render proxies them to the api service.
       - type: rewrite
         source: /api/*
-        destination: https://synester-black-opengym-api.onrender.com/api/:splat
+        destination: https://synester-black-opengym-api.onrender.com/api/*
     headers:
       - path: /*
         name: X-Frame-Options

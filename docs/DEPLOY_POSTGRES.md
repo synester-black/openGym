@@ -42,7 +42,7 @@ Push this fork to your GitHub account. Blueprint deploys only read from git.
 3. After the first deploy, note **both** URLs Render created:
    - the **api** service: `https://<api-name>-xxxx.onrender.com`
    - the **web** static site: `https://<web-name>-xxxx.onrender.com`
-4. Confirm the `/api/*` rewrite destination is `https://<api URL>/api/:splat` (the default in
+4. Confirm the `/api/*` rewrite destination is `https://<api URL>/api/*` (the default in
    `render.yaml` matches the api service name above). The front site is the origin, because that
    is what the browser loads and what the CSRF guard compares against.
 5. Wait for both deploys. Sign out a test: open the web URL → **Create profile** → name +
