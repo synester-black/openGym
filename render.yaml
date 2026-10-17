@@ -1,0 +1,80 @@
+# Render Blueprint for the Postgres fork.
+#
+#   Render dashboard → New + → Blueprint → pick this repo → fill in the env vars it asks for → deploy.
+#
+# Two free services, no persistent disk anywhere:
+#
+#   opengym-api    the backend, built from api/Dockerfile; accounts, per-profile documents,
+#                  session secret, VAPID keys and the audit log all live in Postgres
+#                  (STORAGE=postgres + DATABASE_URL — Neon's free tier works).
+#   opengym-web    the whole frontend (app + exercise animations) as a Render static site,
+#                  which never spins down, with /api rewritten to the api service so the
+#                  browser sees ONE origin — the condition passkeys need.
+#
+# Fill in when Render asks (marked sync: false below):
+#
+#   DATABASE_URL   the POOLED connection string from Neon (ends in -pooler...neon.tech),
+#                  sslmode=require kept on.
+#   ORIGIN         https://<this-static-site>.onrender.com — the front site, NOT the api:
+#                  browsers load the app from there, and the CSRF guard compares ORIGIN
+#                  against the Origin the browser sends.
+#   RP_ID          the same hostname without the scheme.
+#
+# After the first deploy: both phones → open the static site URL in Safari → Create profile →
+# Share → Add to Home Screen. Face ID passkeys work because the origin is HTTPS.
+#
+# Notes:
+# - Free api instances sleep after ~15 min idle. A five-minute ping on /api/health (UptimeRobot,
+#   cron-job.org) removes the sleep AND revives reminder pushes — the endpoint reads memory only,
+#   so the ping never wakes Postgres.
+# - Custom exercise photos/videos land in the api's ephemeral /data/uploads: a restart loses them
+#   and any device that still holds one re-uploads it (the app checks /api/media/missing).
+# - Keep INVITE_ONLY=1 once your two profiles exist; the api URL is public.
+# - One api instance per database — that is the sync contract (pg-store.js header explains).
+
+services:
+  - type: web
+    name: synester-black-opengym-api
+    runtime: docker
+    dockerfilePath: api/Dockerfile
+    dockerContext: api
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: STORAGE
+        value: postgres
+      - key: DATABASE_URL
+        sync: false
+      - key: RP_ID
+        sync: false
+      - key: ORIGIN
+        sync: false
+      - key: RP_NAME
+        value: openGym
+      - key: FIRST_USER_ADMIN
+        value: "1"
+      - key: PASSWORD_LOGIN
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: AUDIT_IP
+        value: "net"
+
+  - type: web
+    name: synester-black-opengym
+    runtime: static
+    buildCommand: cd frontend && npm ci && npm run build && node ../scripts/catalogue/stage-media.mjs dist
+    staticPublishPath: frontend/dist
+    pullRequestPreviewsEnabled: false
+    routes:
+      # Same-origin from the browser's side: session cookie, passkey ceremony and every api call
+      # ride the front site's domain; Render proxies them to the api service.
+      - type: rewrite
+        source: /api/*
+        destination: https://synester-black-opengym-api.onrender.com/api/:splat
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY

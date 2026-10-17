@@ -1,0 +1,33 @@
+name: keepalive
+# Optional: pings the api every 10 minutes so a free-tier Render instance stops sleeping.
+# Without this, the api goes down ~15 min after the last request and a free Static-Site +
+# free-api deployment loses reminder/nudge pushes while it sleeps. /api/health reads memory
+# only (server.js) and never touches Postgres, so the ping earns nothing for Neon to do.
+#
+# More reliable alternatives that run outside GitHub: cron-job.org or UptimeRobot, a 5-minute
+# monitor of https://<your-api>.onrender.com/api/health. GitHub also disables scheduled
+# workflows after 60 days without a commit — either push occasionally or use cron-job.org.
+#
+# Setup: add a repository secret named API_PING_URL with your api's health URL, e.g.
+#   https://your-api.onrender.com/api/health
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: none
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping /api/health
+        run: |
+          if [ -z "$API_PING_URL" ]; then
+            echo "Set the API_PING_URL repository secret to enable keep-alive pings."
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/health.json -w '%{http_code}' "$API_PING_URL")
+          echo "health: $code $(cat /tmp/health.json 2>/dev/null)"
+          test "$code" = 200 || test "$code" = 503   # mainly: something answered
+        env:
+          API_PING_URL: ${{ secrets.API_PING_URL }}

@@ -38,6 +38,22 @@ import { excusedOn, nudgeFor, nudgeWindowOpen, toneOf } from './nudge.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
+/* ---------- fork: pluggable storage (upstream default is untouched) ---------- */
+// STORAGE=postgres moves the accounts document, every per-profile document, the session
+// secret, the VAPID keys and the activity log into a Postgres database (DATABASE_URL; Neon
+// works), leaving DATA_DIR for media uploads only — which makes the api stateless enough to
+// run on hosts with no persistent disk. Without the variable this file does exactly what
+// upstream does, and pg-store.js is never imported.
+//
+// The trade-offs live in pg-store.js's header; the two load-bearing ones: db.json-style saves are
+// debounced write-behind (a kill -9 can roll them back one window), and PUT /api/data's
+// compare-and-write keeps its single-process guarantee only while exactly one api instance
+// runs, which is the only way the storage mode is meant to run.
+const PG_MODE = process.env.STORAGE === 'postgres';
+const STORE = PG_MODE ? await (await import('./pg-store.js')).openPgStore() : null;
+// Read back with preloadStates() once the accounts document is in (below): uid -> raw text,
+// the mirror of what state-<uid>.json held upstream.
+let pgStates = null;
 const RP_ID = process.env.RP_ID || 'localhost';
 const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
 const RP_NAME = process.env.RP_NAME || 'openGym';
@@ -110,9 +126,21 @@ const lock = f => { try { fs.chmodSync(path.join(DATA, f), 0o600); } catch { /* 
 ['secret', 'db.json', 'coach.json'].forEach(lock);
 
 /* ---------- secret + db ---------- */
-const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+let SECRET;
+if (PG_MODE) {
+  SECRET = await STORE.kvGet('secret');
+  if (!SECRET) {
+    SECRET = crypto.randomBytes(32).toString('hex');
+    await STORE.kvPut('secret', SECRET);
+  }
+  // Same refusal a corrupt db.json gets upstream: sign-in is broken already; saying why beats
+  // minting sessions nobody's past device can replay.
+  if (!/^[0-9a-f]{64}$/.test(SECRET)) { console.error('the stored session secret is not 64 hex characters'); process.exit(1); }
+} else {
+  const secretFile = path.join(DATA, 'secret');
+  if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
+  SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+}
 
 const dbFile = path.join(DATA, 'db.json');
 // Every account, passkey and invite. Only a missing file starts empty: an unreadable one (a write
@@ -140,12 +168,31 @@ function loadDb() {
     }
   }
 }
-let db = loadDb();
+let db;
+if (PG_MODE) {
+  // One row, whole object — db.json minus the file. A missing row is the empty instance; an
+  // unreadable one refuses to boot, as loadDb() does for the file after both it and its .bak
+  // failed (there is no .bak to fall back on here: Postgres is the single copy).
+  try {
+    db = await STORE.kvGet('db.json');
+    if (db === null) db = { users: [], creds: [], subs: [], invites: [] };
+  } catch (e) {
+    console.error('the stored accounts document cannot be read:', e.message);
+    console.error('Refusing to start. Fix the database before retrying.');
+    process.exit(1);
+  }
+} else {
+  db = loadDb();
+}
 db.users = db.users || [];
 db.creds = db.creds || [];
 db.subs = db.subs || [];
 db.invites = db.invites || [];
 db.deviceLinks = db.deviceLinks || [];   // unused one-time device links, hashed (device-link.js)
+// Postgres mode: every profile's document, resident. This is the mirror PUT /api/data guards
+// and every readState reads; there is nothing to lazy-load because there is only ever one
+// instance and one writer (the trade-offs are at the top of the file).
+if (PG_MODE) pgStates = await STORE.preloadStates();
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
 // 0600: db.json holds passkey credential material. It used to be covered by a blanket 0700 on
 // the whole directory; now that the directory stays traversable, the file carries its own mode.
@@ -155,6 +202,7 @@ const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(us
 // A write cut short leaves the previous db.json.bak whole (temporary file and rename).
 function saveDb() {
   const text = JSON.stringify(db, null, 2);
+  if (PG_MODE) { STORE.saveDbDoc(db); return; }
   atomicWrite(dbFile, text, 0o600);
   try { atomicWrite(dbFile + '.bak', text, 0o600); }
   catch (e) { console.error('db.json.bak could not be written', e.message); }
@@ -179,6 +227,11 @@ function notePull(user, now = Date.now()) {
 // The later of the last push and the last pull.
 const lastSyncOf = (u, S) => Math.max(S?._ts || 0, u?.lastPull || 0) || null;
 function readState(uid) {
+  if (PG_MODE) {
+    const raw = pgStates?.get(uid);
+    if (raw == null) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  }
   try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
 }
 // GET and PUT /api/data tell a profile with no state yet from one whose file cannot be read: the
@@ -186,6 +239,11 @@ function readState(uid) {
 // replace, losing what a restore could still bring back.
 const UNREADABLE = Symbol('unreadable');
 function readStateStrict(uid) {
+  if (PG_MODE) {
+    const raw = pgStates?.get(uid);
+    if (raw == null) return null;
+    try { return JSON.parse(raw); } catch { return UNREADABLE; }
+  }
   let raw;
   try { raw = fs.readFileSync(stateFile(uid), 'utf8'); }
   catch (e) { return e.code === 'ENOENT' ? null : UNREADABLE; }
@@ -211,8 +269,24 @@ const records = v => (Array.isArray(v) ? v.filter(record) : []);
 /* ---------- push notifications (Web Push / VAPID) ---------- */
 const vapidFile = path.join(DATA, 'vapid.json');
 let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+if (PG_MODE) {
+  vapid = await STORE.kvGet('vapid.json');
+  if (vapid) {
+    // The keys webpush needs, exactly as the file form validated them: whatever else the row
+    // once held is dropped, the same way a JSON file could not carry it.
+    const pk = typeof vapid.publicKey === 'string' ? vapid.publicKey : '';
+    const sk = typeof vapid.privateKey === 'string' ? vapid.privateKey : '';
+    if (!pk || !sk) { console.error('the stored VAPID keys are unusable'); vapid = null; }
+    else vapid = { publicKey: pk, privateKey: sk };
+  }
+  if (!vapid) {
+    vapid = webpush.generateVAPIDKeys();
+    await STORE.kvPut('vapid.json', vapid);
+  }
+} else {
+  try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
+  catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+}
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
@@ -464,6 +538,10 @@ const STATE_CACHE_MAX = 64;
 const STATE_CACHE_TTL_MS = Math.max(50, +(process.env.STATE_CACHE_TTL_MS || 600000) || 600000);
 const stateCache = new Map(); // uid -> { mtimeMs, size, hitAt, S }
 function readStateCached(uid) {
+  // Postgres mode: the whole profile already lives in this process (pgStates), so every read
+  // is a memory hit and nothing here applies. The stat cache below exists to keep the fs read
+  // and its parse off the event loop; there is no stat to be cheap about.
+  if (PG_MODE) return readState(uid);
   let st;
   try { st = fs.statSync(stateFile(uid)); } catch { stateCache.delete(uid); return null; }
   const now = Date.now();
@@ -864,6 +942,7 @@ function auditKeep(rows) {
   return out;
 }
 function compactAudit() {
+  if (PG_MODE) return;               // seeded separately, pruned hourly by its own branch below
   const rows = auditLines();
   for (const r of rows) if (+r.id > auditSeq) auditSeq = +r.id;
   const keep = auditKeep(rows);
@@ -888,14 +967,27 @@ function audit(req, ev, f = {}) {
   if (f.act) rec.act = String(f.act).slice(0, 40);
   const ip = clientIp(req);
   if (ip) rec.ip = ip;
+  // Postgres mode: one INSERT per event, best effort exactly like the append below — a lost
+  // event is logged, never retried, and never allowed to break the route it happened in.
+  if (PG_MODE) { STORE.insertAudit(rec); auditCount++; return; }
   try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); }
   catch (e) { return console.error('audit write failed', e.message); }
   // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
   if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
 }
 if (AUDIT_ON) {
-  compactAudit();                                // prune on boot, seed auditSeq/auditCount
-  setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
+  if (PG_MODE) {
+    // Seed the id counter from the table and prune once, then hourly, the same way the file
+    // compacts on boot: age first, then the newest AUDIT_MAX of what is left.
+    const seed = await STORE.auditSeed();
+    if (seed.maxId > auditSeq) auditSeq = seed.maxId;
+    await STORE.auditPrune({ max: AUDIT_MAX, days: AUDIT_DAYS });
+    auditCount = await STORE.auditCount();
+    setInterval(() => STORE.auditPrune({ max: AUDIT_MAX, days: AUDIT_DAYS }), 3600000).unref();
+  } else {
+    compactAudit();                                // prune on boot, seed auditSeq/auditCount
+    setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
+  }
 }
 
 /* ---------- sign-in throttle ---------- */
@@ -1909,8 +2001,13 @@ const routes = {
   // the status and nothing else, and an instance that cannot write its data directory is exactly
   // what "unhealthy" is for. The 200 keeps the shape it had, plus the flag it is now asserting.
   'GET /api/health': async (req, res) => {
+    // The pinger's target: answers from memory in both modes, so a keep-alive ping never wakes
+    // a sleeping Postgres. `writable` still means the data directory takes writes (media
+    // uploads live there even in Postgres mode); `storage` says which backing is in use.
     if (!dataWritable()) return json(res, 503, { ok: false, writable: false });
-    json(res, 200, { ok: true, users: db.users.length, writable: true });
+    const body = { ok: true, users: db.users.length, writable: true };
+    if (PG_MODE) body.storage = 'postgres';
+    json(res, 200, body);
   },
 
   // Public config the login screen needs before anyone is signed in. `coach` is absent unless
@@ -2273,7 +2370,17 @@ const routes = {
     let text;
     try { text = JSON.stringify(body.state); }
     catch (e) { if (e instanceof RangeError) return json(res, 400, { error: 'invalid state' }); throw e; }
-    atomicWrite(stateFile(user.id), text);
+    // Postgres mode: the row is written, transaction committed, BEFORE the reply — the same
+    // durability atomicWrite's fsync-and-rename gave the file, so a 200 never names a revision
+    // that could vanish in a reset. The in-memory mirror updates only after the write commits:
+    // a failed write leaves it, and the client's next push, exactly as they were.
+    if (PG_MODE) {
+      try { await STORE.putStateRaw(user.id, text); }
+      catch (e) { console.error('state write failed for', user.id, e.message); json(res, 503, { error: 'state write failed' }); return; }
+      pgStates.set(user.id, text);
+    } else {
+      atomicWrite(stateFile(user.id), text);
+    }
     // The stat cache cannot see this write on its own: mtime granularity is 4 ms here (ext4 on
     // this kernel — 3901 of 3999 back-to-back same-size writes shared one timestamp), and a
     // `_rev` going from 7 to 8 does not change the file's size, so two writes inside one 4 ms
@@ -2486,7 +2593,9 @@ const routes = {
     dropDeviceLinks(db, u.id);
     presence.delete(u.id);
     // The training history and any Coach credential of theirs, both outside db.json.
-    try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ }
+    // Postgres mode: the row goes too, not just this process's copy of it.
+    if (PG_MODE) await STORE.deleteState(u.id); else { try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ } }
+    if (PG_MODE) pgStates.delete(u.id);
     try { coachConfig.clearProfileAuth(u.id); } catch { /* nothing stored */ }
     // Their photos and videos — the one place a profile's folder under uploads/ is removed.
     try { MEDIA.removeUser(u.id); } catch (e) { console.error('media: could not remove uploads of', u.id, e.message); }
@@ -2544,9 +2653,18 @@ const routes = {
     const limit = Math.max(1, Math.min(200, +q.get('limit') || 100));
     const before = +q.get('before') || Infinity;
     const cat = q.get('cat') || '';
-    let rows = auditKeep(auditLines()).reverse();
-    if (cat === 'fail') rows = rows.filter(r => !r.ok);
-    else if (cat) rows = rows.filter(r => String(r.ev).startsWith(cat + '.'));
+    let rows;
+    if (PG_MODE) {
+      // Newest first, retention applied, then the one chosen category — the same shape the
+      // file branch produces below, before the same paging takes over. The flush first, so a
+      // view right after a clear (or any event) cannot race the INSERT that logged it.
+      await STORE.auditFlush();
+      rows = await STORE.auditRows({ keepFn: auditKeep, cat, failOnly: cat === 'fail' });
+    } else {
+      rows = auditKeep(auditLines()).reverse();
+      if (cat === 'fail') rows = rows.filter(r => !r.ok);
+      else if (cat) rows = rows.filter(r => String(r.ev).startsWith(cat + '.'));
+    }
     const page = rows.filter(r => r.id < before).slice(0, limit);
     json(res, 200, {
       events: page,
@@ -2563,7 +2681,10 @@ const routes = {
   // ./data/audit.log already is the export, in a format jq reads directly.
   'POST /api/admin/audit/clear': async (req, res) => {
     const admin = requireAdmin(req, res); if (!admin) return;
-    try { fs.unlinkSync(auditFile); } catch { /* nothing logged yet */ }
+    try {
+      if (PG_MODE) await STORE.auditClear();
+      else fs.unlinkSync(auditFile);
+    } catch { /* nothing logged yet */ }
     auditCount = 0;
     audit(req, 'admin.audit.clear', { user: admin });
     json(res, 200, { ok: true });
