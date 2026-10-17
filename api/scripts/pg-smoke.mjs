@@ -154,17 +154,38 @@ async function main() {
     assert.equal(doc.data.rev, 2);
     assert.equal(doc.data.state.workouts.length, 7, 'round trip kept every workout');
   }
-  console.log('7. restart: SIGTERM, fresh process, same database');
+  console.log('7. save Ollama-compatible Coach settings and encrypted key');
+  {
+    const cfg = await call('POST', '/api/admin/coach/config', { body: {
+      enabled: true, provider: 'compatible', baseUrl: 'https://ollama.com/v1', model: 'gemma4:31b', community: true
+    } });
+    assert.equal(cfg.status, 200, `Coach config: ${JSON.stringify(cfg.data)}`);
+    const key = await call('POST', '/api/admin/coach/connect', { body: {
+      provider: 'compatible', type: 'apikey', token: 'smoke-only-not-a-real-key'
+    } });
+    assert.equal(key.status, 200, `Coach API key: ${JSON.stringify(key.data)}`);
+    const visible = await call('GET', '/api/config');
+    assert.equal(visible.data.coach?.provider, 'compatible', 'connected Coach is visible to signed-in profiles');
+    const sharing = await call('POST', '/api/coach/cohort/share', { body: { share: true } });
+    assert.equal(sharing.data.sharing, true, 'per-profile Coach history store accepts writes');
+    const cohort = await call('GET', '/api/coach/cohort');
+    assert.equal(cohort.data.sharing, true, 'Coach state is read from Postgres-backed profile data');
+  }
+  console.log('8. restart: SIGTERM, fresh process, same database (Coach settings and secret persist)');
   await stop();
   await boot();
   {
+    const cfg = await call('GET', '/api/config');
+    assert.equal(cfg.data.coach?.provider, 'compatible', 'Coach settings survived restart');
+    const cohort = await call('GET', '/api/coach/cohort');
+    assert.equal(cohort.data.sharing, true, 'per-profile Coach settings survived restart');
     const rev = await call('GET', '/api/data/rev');
     assert.equal(rev.data.rev, 2, `revision survived the restart (got ${rev.data.rev})`);
     const r = await call('PUT', '/api/data', { body: { baseRev: 2, state: bigState(9) } });
     assert.equal(r.status, 200, `push after restart: ${JSON.stringify(r.data)}`);
     assert.equal(r.data.rev, 3, 'the counter continues after a restart');
   }
-  console.log('8. admin: activity log readable, clear refused for a profile, fine for the admin');
+  console.log('9. admin: activity log readable, clear refused for a profile, fine for the admin');
   {
     // Re-sign in to the admin's cookie (jar held u1's session; the restart flushed nothing of it).
     const sign = await call('POST', '/api/login/password', { session: false, body: { name: `u1-${RUN}`, password: PW } });
@@ -187,7 +208,7 @@ async function main() {
     const after = await call('GET', '/api/admin/audit');
     assert.ok(after.data.events.length >= 1, 'the clearing itself is logged');
   }
-  console.log('9. second profile isolated');
+  console.log('10. second profile isolated');
   {
     const adminCookie = new Map(jar); jar.clear();
     await call('POST', '/api/login/password', { session: false, body: { name: `u2-${RUN}`, password: PW } });

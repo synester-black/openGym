@@ -7,9 +7,10 @@
  * which point the *client* applies it to the plan and the outcome joins the synced log, which
  * is exactly where an audit trail belongs.
  *
- * Everything here is deliberately in-process and file-backed. A single-core box running one
- * household's gym app does not need a job queue with a broker; it needs jobs that cannot pile
- * up, cannot run forever, and cannot lie about what happened when the container restarts.
+ * Everything here is deliberately in-process and file-backed by default. A single-core box
+ * running one household's gym app does not need a job queue with a broker; it needs jobs that
+ * cannot pile up, cannot run forever, and cannot lie about what happened when the container
+ * restarts. The Postgres fork injects the same synchronous API over its single-process store.
  */
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -35,6 +36,22 @@ export { hashPlan, buildPrompt };
 
 const DATA = process.env.DATA_DIR || '/data';
 const COACH_DIR = path.join(DATA, 'coach');
+let pgUsers = null;
+let pgStateReader = null;
+let pgStateIds = null;
+let pgSaveUser = null;
+let pgDeleteUser = null;
+
+// Postgres mode keeps the same synchronous jobs API and in-memory, single-instance semantics,
+// but persists each profile's Coach conversation/status as a JSON document in Neon. These
+// callbacks are installed during server boot before any request or recovery tick can use them.
+export function usePostgres({ users, readState, listUserIds, saveUser, deleteUser }) {
+  pgUsers = users;
+  pgStateReader = readState;
+  pgStateIds = listUserIds;
+  pgSaveUser = saveUser;
+  pgDeleteUser = deleteUser;
+}
 
 // Five minutes by default. A local model on a small CPU box can legitimately need more; a
 // cloud API that needs more has a problem. COACH_JOB_TIMEOUT_MS overrides, never below one minute.
@@ -50,10 +67,16 @@ const userFile = uid => path.join(COACH_DIR, safe(uid) + '.json');
 const EMPTY = { daily: null, current: null, pending: null, history: [] };
 
 export function readUser(uid) {
+  if (pgUsers) return { ...EMPTY, ...(pgUsers.get(uid) || {}) };
   try { return { ...EMPTY, ...JSON.parse(fs.readFileSync(userFile(uid), 'utf8')) }; }
   catch { return { ...EMPTY }; }
 }
 function writeUser(uid, rec) {
+  if (pgUsers) {
+    pgUsers.set(uid, rec);
+    pgSaveUser?.(uid, rec);
+    return;
+  }
   fs.mkdirSync(COACH_DIR, { recursive: true, mode: 0o700 });
   const file = userFile(uid), tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
@@ -73,7 +96,12 @@ function patchUser(uid, patch) {
  *  and either way finishes without writing anything back (see finish). */
 export function clearUser(uid) {
   const { daily } = readUser(uid);
-  try { fs.unlinkSync(userFile(uid)); } catch { /* nothing to clear */ }
+  if (pgUsers) {
+    pgUsers.delete(uid);
+    pgDeleteUser?.(uid);
+  } else {
+    try { fs.unlinkSync(userFile(uid)); } catch { /* nothing to clear */ }
+  }
   if (daily?.date === todayISO()) writeUser(uid, { ...EMPTY, daily });
   const queued = queue.findIndex(j => j.uid === uid);
   if (queued >= 0) { queue.splice(queued, 1); inflight.delete(uid); }
@@ -84,6 +112,7 @@ export function clearUser(uid) {
 
 /** Every profile with a state file — the population a cohort is drawn from. */
 export function listUserIds() {
+  if (pgStateIds) return pgStateIds();
   try {
     return fs.readdirSync(DATA).filter(f => /^state-[a-zA-Z0-9_-]+\.json$/.test(f)).map(f => f.slice(6, -5));
   } catch { return []; }
@@ -101,6 +130,7 @@ export function setShare(uid, share) {
 }
 
 export function readState(uid) {
+  if (pgStateReader) return pgStateReader(uid);
   try { return JSON.parse(fs.readFileSync(path.join(DATA, 'state-' + safe(uid) + '.json'), 'utf8')); }
   catch { return null; }
 }
@@ -497,9 +527,9 @@ export async function testRun() {
 export function recoverOnBoot() {
   let n = 0;
   try {
-    for (const f of fs.readdirSync(COACH_DIR)) {
-      if (!f.endsWith('.json')) continue;
-      const uid = f.replace(/\.json$/, '');
+    const ids = pgUsers ? [...pgUsers.keys()] : fs.readdirSync(COACH_DIR)
+      .filter(f => f.endsWith('.json')).map(f => f.replace(/\.json$/, ''));
+    for (const uid of ids) {
       const rec = readUser(uid);
       if (!rec.current) continue;
       writeUser(uid, {

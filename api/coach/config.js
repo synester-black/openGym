@@ -1,9 +1,10 @@
 /* Coach instance configuration — the one place that knows whether this instance offers the
    AI Coach at all, which provider drives it, and whose account pays for a job.
 
-   Instance settings live in ./data/coach.json rather than the environment, because the whole
-   point of the admin-dashboard flow is that enabling the Coach never requires editing a file
-   or restarting the stack. The one env knob is COACH_DISABLED, which force-disables the
+   Instance settings live in ./data/coach.json rather than the environment on a file-backed
+   install; the Postgres fork stores the same document in its database. The whole point of the
+   admin-dashboard flow is that enabling the Coach never requires editing a file or restarting
+   the stack. The one env knob is COACH_DISABLED, which force-disables the
    feature regardless of what is stored — a fleet operator's kill switch, not a configuration
    step.
 
@@ -31,6 +32,16 @@ import { MAX_OUTPUT_TOKENS } from './core/adapters/http.js';
 
 const DATA = process.env.DATA_DIR || '/data';
 const FILE = path.join(DATA, 'coach.json');
+let pgBackend = null;
+
+// server.js installs this after its Postgres tables and instance secret are loaded. All Coach
+// reads/writes stay synchronous like the file adapter; the supplied save callbacks queue durable
+// snapshots through pg-store.js. With no backend installed, the upstream file path is unchanged.
+export function usePostgres({ config = null, secret, saveConfig, profileAuth = new Map(), saveProfileAuth, deleteProfileAuth }) {
+  pgBackend = { config, secret, saveConfig, profileAuth, saveProfileAuth, deleteProfileAuth };
+  cache = null;
+  keyCache = null;
+}
 
 /* Where a provider runtime that manages its own credential cache is allowed to keep it.
  *
@@ -114,7 +125,7 @@ let keyCache = null;
 function key() {
   if (keyCache) return keyCache;
   // Read the secret lazily: server.js creates it at boot, and this module may be imported first.
-  const secret = fs.readFileSync(path.join(DATA, 'secret'), 'utf8').trim();
+  const secret = pgBackend?.secret || fs.readFileSync(path.join(DATA, 'secret'), 'utf8').trim();
   keyCache = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(secret, 'utf8'), Buffer.alloc(0), Buffer.from('opengym-coach-v1'), 32));
   return keyCache;
 }
@@ -143,8 +154,10 @@ function atomicWrite(file, content, mode) {
 }
 export function load() {
   if (cache) return cache;
-  let stored = {};
-  try { stored = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { /* absent = feature off */ }
+  let stored = pgBackend ? (pgBackend.config || {}) : {};
+  if (!pgBackend) {
+    try { stored = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { /* absent = feature off */ }
+  }
   cache = { ...DEFAULTS, ...stored, caps: { ...DEFAULTS.caps, ...(stored.caps || {}) } };
 
   // Until v1.2.11 this file held ONE credential, ONE model and ONE binding — for whichever
@@ -174,7 +187,8 @@ export function load() {
 export function save(patch) {
   const next = { ...load(), ...patch };
   cache = next;
-  atomicWrite(FILE, JSON.stringify(next, null, 2), 0o600);
+  if (pgBackend) pgBackend.saveConfig(next);
+  else atomicWrite(FILE, JSON.stringify(next, null, 2), 0o600);
   return next;
 }
 // Test seam: forget the in-memory copy so the next load() re-reads from disk.
@@ -216,13 +230,24 @@ export function profileAuthFile(uid) {
   return path.join(DATA, `coach-auth-${uid}.json`);
 }
 export function loadProfileAuth(uid) {
+  if (pgBackend) return pgBackend.profileAuth.get(uid) || null;
   try { return JSON.parse(fs.readFileSync(profileAuthFile(uid), 'utf8')); } catch { return null; }
 }
 export function saveProfileAuth(uid, auth) {
+  if (pgBackend) {
+    pgBackend.profileAuth.set(uid, auth);
+    pgBackend.saveProfileAuth?.(uid, auth);
+    return auth;
+  }
   atomicWrite(profileAuthFile(uid), JSON.stringify(auth, null, 2), 0o600);
   return auth;
 }
 export function clearProfileAuth(uid) {
+  if (pgBackend) {
+    pgBackend.profileAuth.delete(uid);
+    pgBackend.deleteProfileAuth?.(uid);
+    return true;
+  }
   try { fs.unlinkSync(profileAuthFile(uid)); return true; } catch { return false; }
 }
 

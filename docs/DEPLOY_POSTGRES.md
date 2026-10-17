@@ -49,7 +49,23 @@ Push this fork to your GitHub account. Blueprint deploys only read from git.
    password (PASSWORD_LOGIN is on in this Blueprint; passkeys work too once both phones have
    visited over HTTPS).
 
-## 4. iPhone / Android
+## 4. Ollama Cloud Coach
+
+The default api image supports HTTP providers, including the OpenAI-compatible Ollama Cloud
+endpoint; no local Ollama server or special Coach image is needed.
+
+1. In Ollama, create an API key at **ollama.com → Settings → API keys**.
+2. Sign in to openGym as an admin → **Settings → Account → Admin dashboard → AI Coach**.
+3. Choose **OpenAI-compatible endpoint** and enter `https://ollama.com/v1` as the endpoint.
+4. Choose **Use an API key**, paste the Ollama key into the Coach card, then **List models** and
+   select `gemma4:31b` from the endpoint's list.
+5. Run **Test the Coach**, then switch the Coach on.
+
+The Coach card encrypts the key using the instance secret and stores both it and the model choice
+in Neon. **Do not put the Ollama key in GitHub, `render.yaml`, or this chat.** If you rotate it,
+replace it in the Coach card. The endpoint and model name follow Ollama's current API docs.
+
+## 5. iPhone / Android
 
 - **iPhone (PWA):** Safari → the web URL → sign in → Share → **Add to Home Screen**.
   Face ID passkeys bind to that hostname (RP_ID); Share Sheets, offline mode and the rest
@@ -57,7 +73,7 @@ Push this fork to your GitHub account. Blueprint deploys only read from git.
 - **Android:** either the same PWA way, or the upstream signed APK paired with this server
   (docs/MOBILE.md covers pairing).
 
-## 5. Keep-alive (makes free tier always-on)
+## 6. Keep-alive (makes free tier always-on)
 
 Free api instances sleep ~15 minutes after the last request; while asleep they send no
 reminder/nudge pushes (rest-timer alerts only matter while a workout is open anyway — the
@@ -69,7 +85,7 @@ device saturates the connection, keeping the api awake the whole session).
   (= the api's health URL) and it pings every 10 minutes. GitHub disables scheduled workflows
   after 60 days without commits; a push to the fork resets the timer.
 
-## 6. What breaks, deliberately
+## 7. What breaks, deliberately
 
 - **Two api instances behind one database are forbidden.** The per-profile compare-and-write
   that keeps two phones from clobbering each other guards one process's memory (upstream: one
@@ -78,13 +94,13 @@ device saturates the connection, keeping the api awake the whole session).
   A restart empties it; the devices re-upload what they still hold (the app asks the server
   what it is missing). No persistent disk is bought — that is the free tier's one compromise;
   a paid disk, or an S3/R2 driver later, ends it.
-- **The MCP server and the Coach** read their own files under DATA_DIR and do not know about
-  Postgres. The default image has neither anyway; do not enable the Coach in this mode.
+- **Coach settings, encrypted API keys, and per-profile Coach history** live in Postgres in this
+  fork. The MCP server still reads DATA_DIR files and is not included here.
 - **Upstream updates:** this fork touches `api/server.js` in small marked blocks and adds
   `api/pg-store.js`. Merge conflicts come to those blocks; re-run `api/scripts/pg-smoke.mjs`
   plus the stock `api npm test` after merging.
 
-## 7. Local development
+## 8. Local development
 
 ```sh
 # test database
@@ -107,13 +123,13 @@ docker exec opengym-pg psql -U postgres -d opengym \
 The smoke script drops and recreates its three tables. It refuses to run against a remote
 database unless you explicitly set `PG_SMOKE_ALLOW_RESET=1`; prefer a disposable local database.
 
-## 8. Backups
+## 9. Backups
 
-Everything now lives in the database. Export whole profiles from the app (Settings → export)
-or, at any time, from psql:
+Application records now live in the database. Export whole profiles from the app (Settings →
+export) or, at any time, from psql:
 
 ```sql
-SELECT data FROM opengym_documents;      -- accounts, secret, VAPID keys
+SELECT key, data FROM opengym_documents; -- accounts, secret, VAPID, Coach config/history
 SELECT uid, data FROM opengym_states;    -- every profile's workouts and plans
 SELECT rec  FROM opengym_audit;          -- activity log
 ```

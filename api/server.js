@@ -15,6 +15,7 @@ import {
 import webpush from 'web-push';
 import * as coachConfig from './coach/config.js';
 import * as coachJobs from './coach/jobs.js';
+import * as coachHandle from './coach/handle.js';
 import { coachRoutes } from './coach/routes.js';
 import { startCadence } from './coach/cadence.js';
 import { startWarmup } from './coach/warmup.js';
@@ -193,6 +194,29 @@ db.deviceLinks = db.deviceLinks || [];   // unused one-time device links, hashed
 // and every readState reads; there is nothing to lazy-load because there is only ever one
 // instance and one writer (the trade-offs are at the top of the file).
 if (PG_MODE) pgStates = await STORE.preloadStates();
+if (PG_MODE) {
+  const coachUsersPrefix = 'coach:user:';
+  const coachAuthPrefix = 'coach:auth:';
+  const coachUsersRows = await STORE.loadDocs(coachUsersPrefix);
+  const coachAuthRows = await STORE.loadDocs(coachAuthPrefix);
+  const coachAuth = new Map([...coachAuthRows].map(([key, value]) => [key.slice(coachAuthPrefix.length), value]));
+  coachConfig.usePostgres({
+    config: await STORE.kvGet('coach.json'),
+    secret: SECRET,
+    saveConfig: value => STORE.saveDoc('coach.json', value),
+    profileAuth: coachAuth,
+    saveProfileAuth: (uid, value) => STORE.saveDoc(coachAuthPrefix + uid, value),
+    deleteProfileAuth: uid => STORE.deleteDoc(coachAuthPrefix + uid)
+  });
+  coachJobs.usePostgres({
+    users: new Map([...coachUsersRows].map(([key, value]) => [key.slice(coachUsersPrefix.length), value])),
+    readState,
+    listUserIds: () => [...pgStates.keys()],
+    saveUser: (uid, value) => STORE.saveDoc(coachUsersPrefix + uid, value),
+    deleteUser: uid => STORE.deleteDoc(coachUsersPrefix + uid)
+  });
+  coachHandle.setSecret(SECRET);
+}
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
 // 0600: db.json holds passkey credential material. It used to be covered by a blanket 0700 on
 // the whole directory; now that the directory stays traversable, the file carries its own mode.

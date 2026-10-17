@@ -5,7 +5,8 @@
 # Two free services, no persistent disk anywhere:
 #
 #   opengym-api    the backend, built from api/Dockerfile; accounts, per-profile documents,
-#                  session secret, VAPID keys and the audit log all live in Postgres
+#                  Coach configuration/history, session secret, VAPID keys and audit log
+#                  live in Postgres
 #                  (STORAGE=postgres + DATABASE_URL — Neon's free tier works).
 #   opengym-web    the whole frontend (app + exercise animations) as a Render static site,
 #                  which never spins down, with /api rewritten to the api service so the

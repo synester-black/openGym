@@ -1,9 +1,11 @@
-/* Postgres storage driver (fork): replaces the fs DATA_DIR for everything except media.
+/* Postgres storage driver (fork): replaces the fs DATA_DIR for app state, Coach config/history,
+ * and the instance secret; media blobs remain on the filesystem.
  *
  * Chosen server-side with STORAGE=postgres and DATABASE_URL. Everything server.js keeps in
- * files upstream lands in three tables — accounts and small JSON (documents), one whole
- * document per profile (states), the activity log (audit) — so the api needs no persistent
- * disk and runs anywhere that speaks to Postgres, including serverless hosts. The default
+ * files upstream lands in three tables — accounts, Coach settings/history and other small JSON
+ * (documents), one whole document per profile (states), and the activity log (audit) — so the
+ * api needs no persistent disk for application data and runs anywhere that speaks to Postgres,
+ * including serverless hosts. The default
  * 'fs' behaviour of server.js is untouched, and this file is only ever imported when that
  * env var says so, so stock deploys do not even parse it.
  *
@@ -38,6 +40,7 @@ const TABLES = `
     at timestamptz  NOT NULL DEFAULT now()
   );
 `;
+const DELETE_DOC = Symbol('delete-document');
 
 export async function openPgStore(log = console) {
   const url = String(process.env.DATABASE_URL || '').trim();
@@ -61,11 +64,15 @@ export async function openPgStore(log = console) {
 
   async function writeDocs(values) {
     for (const [key, value] of values) {
-      await pool.query(
-        `INSERT INTO opengym_documents (key, data, updated_at) VALUES ($1, $2, now())
-         ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = now()`,
-        [key, JSON.stringify(value)]
-      );
+      if (value === DELETE_DOC) {
+        await pool.query('DELETE FROM opengym_documents WHERE key = $1', [key]);
+      } else {
+        await pool.query(
+          `INSERT INTO opengym_documents (key, data, updated_at) VALUES ($1, $2, now())
+           ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = now()`,
+          [key, JSON.stringify(value)]
+        );
+      }
     }
   }
 
@@ -120,6 +127,16 @@ export async function openPgStore(log = console) {
     },
     // The accounts document: one row, whole object, like DB.json on disk.
     saveDbDoc(value) { dirty.set('db.json', value); scheduleFlush(); return true; },
+    // The Coach is synchronous in its file-backed API. In pg mode its in-memory cache stays
+    // synchronous too, while these snapshots persist through the same retryable write queue.
+    saveDoc(key, value) { dirty.set(key, value); scheduleFlush(); return true; },
+    deleteDoc(key) { dirty.set(key, DELETE_DOC); scheduleFlush(); return true; },
+    async loadDocs(prefix) {
+      const r = await pool.query(
+        'SELECT key, data FROM opengym_documents WHERE left(key, length($1)) = $1', [prefix]
+      );
+      return new Map(r.rows.map(x => [x.key, x.data]));
+    },
     flushNow() { clearTimeout(flushTimer); flushTimer = null; flush(); },
 
     /* ---- per-profile documents ---- */
